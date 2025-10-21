@@ -369,16 +369,77 @@ def auto_load_model(args, model, model_without_ddp, optimizer,optimizer_d, loss_
                     args.resume, map_location='cpu', check_hash=True)
             else:
                 checkpoint = torch.load(args.resume, map_location='cpu')
-            model_without_ddp.load_state_dict(checkpoint['model'])
-            model.module.discriminator.load_state_dict(checkpoint['discriminator'])  # 加载判别器权重
+            
+            # 使用strict=False以支持向后兼容（旧checkpoint可能缺少新组件）
+            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(
+                checkpoint['model'], strict=False
+            )
+            
+            # 智能处理缺失的键
+            if missing_keys:
+                # 预期缺失的键（不参与训练或从固定文件加载的组件）
+                expected_missing = [k for k in missing_keys 
+                                   if k.startswith('vgg_loss') or k.startswith('discriminator')]
+                # 关键缺失的键（意外缺失，可能导致问题）
+                critical_missing = [k for k in missing_keys 
+                                   if not k.startswith('vgg_loss') 
+                                   and not k.startswith('discriminator')]
+                
+                if expected_missing:
+                    print(f"[INFO] Using initialized weights for new components:")
+                    if any(k.startswith('vgg_loss') for k in expected_missing):
+                        print("  - vgg_loss (will load from vgg19/vgg19-dcbb9e9d.pth)")
+                    if any(k.startswith('discriminator') for k in expected_missing):
+                        print("  - discriminator (using random initialization)")
+                
+                if critical_missing:
+                    print(f"[WARNING] Critical keys missing from checkpoint: {critical_missing[:5]}")
+                    raise RuntimeError(f"Critical keys missing in checkpoint. Cannot resume safely.")
+            
+            if unexpected_keys:
+                print(f"[INFO] Unexpected keys in checkpoint (will be ignored): {unexpected_keys[:5]}")
+            
+            # 尝试加载判别器权重（如果checkpoint中有的话）
+            if 'discriminator' in checkpoint:
+                try:
+                    model.module.discriminator.load_state_dict(checkpoint['discriminator'])
+                    print("[INFO] Discriminator weights loaded from checkpoint")
+                except Exception as e:
+                    print(f"[INFO] Could not load discriminator from checkpoint (using initialization): {e}")
+            else:
+                print("[INFO] Discriminator not found in checkpoint (using initialization)")
+            
             print("Resume checkpoint %s" % args.resume)
             if 'optimizer' in checkpoint and 'epoch' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer'])
-                optimizer_d.load_state_dict(checkpoint['optimizer_d'])
+                # 尝试加载主优化器（模型结构改变可能导致参数组不匹配）
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    print("[INFO] Main optimizer loaded from checkpoint")
+                except (ValueError, KeyError) as e:
+                    print(f"[WARNING] Could not load optimizer state (parameter groups mismatch)")
+                    print(f"[INFO] Continuing with fresh optimizer state. LR schedule will continue from epoch {checkpoint['epoch'] + 1}")
+                    print(f"         (This is safe: only momentum/adaptive states are reset)")
+                
+                # 尝试加载判别器优化器（如果checkpoint中有的话）
+                if 'optimizer_d' in checkpoint:
+                    try:
+                        optimizer_d.load_state_dict(checkpoint['optimizer_d'])
+                        print("[INFO] Discriminator optimizer loaded from checkpoint")
+                    except Exception as e:
+                        print(f"[INFO] Could not load discriminator optimizer (using initialization): {e}")
+                else:
+                    print("[INFO] Discriminator optimizer not found in checkpoint (using initialization)")
+                
                 args.start_epoch = checkpoint['epoch'] + 1
+                
+                # 尝试加载loss scaler
                 if 'scaler' in checkpoint:
-                    loss_scaler.load_state_dict(checkpoint['scaler'])
-                    print('loss scaler', checkpoint['scaler'])
+                    try:
+                        loss_scaler.load_state_dict(checkpoint['scaler'])
+                        print('[INFO] Loss scaler loaded from checkpoint')
+                    except Exception as e:
+                        print(f"[INFO] Could not load loss scaler (using initialization): {e}")
+                
                 print("With optim & sched!")
     else:
         # deepspeed, only support '--auto_resume'.

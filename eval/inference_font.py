@@ -121,6 +121,22 @@ def main(rank, world_size):
     font_dir = args.gen_dir
     img_src_dir = args.source_dir
     out_dir = args.out_dir
+    
+    # 验证路径存在性
+    if not os.path.exists(style_dir):
+        print(f"ERROR: Reference directory does not exist: {style_dir}")
+        return
+    if not os.path.exists(font_dir):
+        print(f"ERROR: Generation directory does not exist: {font_dir}")
+        return
+    if not os.path.exists(img_src_dir):
+        print(f"ERROR: Source directory does not exist: {img_src_dir}")
+        return
+    
+    print(f"Reference dir: {style_dir}")
+    print(f"Generation dir: {font_dir}")
+    print(f"Source dir: {img_src_dir}")
+    print(f"Output dir: {out_dir}")
 
     # 加载prompt列表
     try:
@@ -145,15 +161,39 @@ def main(rank, world_size):
 
         # 查找第一个可用的prompt
         selected_prompt = None
+        missing_files = []
         for prompt in prompt_list:
             prompt_path = os.path.join(style_dir, font_name, f"{prompt}.png")
             img2_path = os.path.join(img_src_dir, f"{prompt}.png")
+            
+            # 调试信息：记录缺失的文件
+            if not os.path.exists(prompt_path):
+                missing_files.append(f"ref: {prompt_path}")
+            if not os.path.exists(img2_path):
+                missing_files.append(f"src: {img2_path}")
+                
             if os.path.exists(prompt_path) and os.path.exists(img2_path):
                 selected_prompt = prompt
                 break
 
         if selected_prompt is None:
             print(f"No valid prompt found for {font_name}")
+            print(f"Available prompts: {prompt_list[:10]}")  # 显示前10个prompt
+            print(f"Missing files for first few prompts:")
+            for i, missing in enumerate(missing_files[:6]):
+                print(f"  {i+1}. {missing}")
+            print(f"Style dir: {style_dir}")
+            print(f"Font name: {font_name}")
+            print(f"Source dir: {img_src_dir}")
+            
+            # 检查字体文件夹是否存在
+            font_ref_path = os.path.join(style_dir, font_name)
+            if not os.path.exists(font_ref_path):
+                print(f"ERROR: Font reference folder does not exist: {font_ref_path}")
+            else:
+                ref_files = os.listdir(font_ref_path)
+                print(f"Reference font has {len(ref_files)} files")
+                print(f"First few reference files: {ref_files[:5]}")
             continue
 
         print(f"Selected prompt: {selected_prompt} for font {font_name}(Rank {rank})")

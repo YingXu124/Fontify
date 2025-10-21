@@ -392,61 +392,101 @@ class Fontify(nn.Module):
         torch.nn.init.normal_(self.mask_token, std=.02)
         torch.nn.init.normal_(self.segment_token_x, std=.02)
         torch.nn.init.normal_(self.segment_token_y, std=.02)
+        
+        # VGG感知损失（只初始化一次，避免重复加载权重）
+        self.vgg_loss = VGGPerceptualLoss()
+        
         self.apply(self._init_weights)
 
-    def canny_edge_detection(self, img, low_threshold=0.1, high_threshold=0.3):
+    def get_dynamic_loss_weights(self, epoch, adv_warmup_epochs=8, edge_warmup_epochs=10, 
+                                warmup_duration=8):
         """
-        :param img: (Tensor [B, C, H, W])
-        :return: (Tensor [B, 1, H, W])
+        计算动态损失权重，实现渐进式损失加入策略
+        
+        Args:
+            epoch: 当前训练epoch
+            adv_warmup_epochs: 对抗损失开始加入的epoch（默认8，提前开始）
+            edge_warmup_epochs: 边缘损失开始加入的epoch（默认10）
+            warmup_duration: warmup持续时间（默认8个epoch，延长训练时间）
+        
+        Returns:
+            adv_weight: 对抗损失权重 [0, 0.3]
+            edge_weight: 边缘损失权重 [0, 0.2]
         """
+        # 对抗损失权重
+        if epoch < adv_warmup_epochs:
+            adv_weight = 0.0
+        elif epoch < adv_warmup_epochs + warmup_duration:
+            # 线性warmup
+            progress = (epoch - adv_warmup_epochs) / warmup_duration
+            adv_weight = 0.3 * progress  # 从0.1提高到0.3，加快对抗损失收敛
+        else:
+            adv_weight = 0.3  # 从0.1提高到0.3，加快对抗损失收敛
+        
+        # 边缘损失权重
+        if epoch < edge_warmup_epochs:
+            edge_weight = 0.0
+        elif epoch < edge_warmup_epochs + warmup_duration:
+            progress = (epoch - edge_warmup_epochs) / warmup_duration
+            edge_weight = 0.2 * progress  # 从0.8降低到0.2，保护细笔画
+        else:
+            edge_weight = 0.2  # 从0.8降低到0.2，保护细笔画
+        
+        return adv_weight, edge_weight
+
+    def improved_edge_detection(self, img):
+        """
+        改进的边缘检测，保护细笔画
+        - 使用更温和的梯度计算
+        - 添加笔画保护机制
+        - 针对中文字体优化
+        
+        :param img: (Tensor [B, C, H, W]) 输入图像
+        :return: (Tensor [B, 1, H, W]) 边缘强度图，值域[0, 1]
+        """
+        # 1. 转换为灰度图
         if img.shape[1] == 3:
             img_gray = 0.299 * img[:, 0, :, :] + 0.587 * img[:, 1, :, :] + 0.114 * img[:, 2, :, :]
             img_gray = img_gray.unsqueeze(1)  # [B, 1, H, W]
         else:
             img_gray = img
 
-        kernel_size = 5
-        sigma = 1.4
-        x = torch.linspace(-kernel_size // 2 + 1, kernel_size // 2, kernel_size)
-        y = torch.linspace(-kernel_size // 2 + 1, kernel_size // 2, kernel_size)
-        x, y = torch.meshgrid(x, y)
+        # 2. 更温和的高斯模糊（减少sigma，保护细笔画）
+        kernel_size = 3  # 从5减少到3
+        sigma = 0.8      # 从1.4减少到0.8
+        x = torch.linspace(-kernel_size // 2 + 1, kernel_size // 2, kernel_size, device=img.device)
+        y = torch.linspace(-kernel_size // 2 + 1, kernel_size // 2, kernel_size, device=img.device)
+        x, y = torch.meshgrid(x, y, indexing='ij')
         gauss = torch.exp(- (x ** 2 + y ** 2) / (2 * sigma ** 2))
         gauss = gauss / gauss.sum()
-        gauss = gauss.unsqueeze(0).unsqueeze(0).to(img_gray.device)  # [1, 1, K, K]
+        gauss = gauss.unsqueeze(0).unsqueeze(0)
         blurred = F.conv2d(img_gray, gauss, padding=kernel_size // 2)
 
-        sobel_x = torch.tensor([[-1, 0, 1],
-                                [-2, 0, 2],
-                                [-1, 0, 1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(blurred.device)
-        sobel_y = torch.tensor([[-1, -2, -1],
+        # 3. 更温和的Sobel算子（保护细笔画）
+        sobel_x = torch.tensor([[-0.5, 0, 0.5],    # 从[-1,0,1]改为[-0.5,0,0.5]
+                                [-1, 0, 1],
+                                [-0.5, 0, 0.5]], dtype=torch.float32, device=img.device).unsqueeze(0).unsqueeze(0)
+        sobel_y = torch.tensor([[-0.5, -1, -0.5],
                                 [0, 0, 0],
-                                [1, 2, 1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(blurred.device)
+                                [0.5, 1, 0.5]], dtype=torch.float32, device=img.device).unsqueeze(0).unsqueeze(0)
 
         grad_x = F.conv2d(blurred, sobel_x, padding=1)
         grad_y = F.conv2d(blurred, sobel_y, padding=1)
 
-        magnitude = (grad_x ** 2 + grad_y ** 2) ** 0.5
-        orientation = torch.atan2(grad_y, grad_x) * (180 / torch.pi) % 180
+        # 4. 更温和的梯度幅值计算
+        magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+        
+        # 5. 笔画保护：使用sigmoid平滑处理
+        magnitude = torch.sigmoid(magnitude * 5)  # 放大后sigmoid，保护细笔画
+        
+        # 6. 自适应归一化（保护细笔画）
+        max_val = magnitude.amax(dim=(2, 3), keepdim=True)
+        magnitude = magnitude / (max_val + 1e-8)
+        
+        # 7. 进一步保护细笔画：降低整体强度
+        magnitude = magnitude * 0.7  # 降低整体强度
 
-        zeros = torch.zeros_like(orientation)
-        pos_angle = torch.stack([zeros, orientation], dim=2)
-        neg_angle = torch.stack([orientation, zeros], dim=2)
-
-        pos_idx = (orientation <= 22.5) | (orientation > 157.5)
-        pos_peak = F.max_pool2d(magnitude * pos_angle[:, :, 0], (3, 3), stride=1, padding=1)[:, :, 1:-1, 1:-1]
-        pos_mask = (magnitude[:, :, 1:-1, 1:-1] > pos_peak) & pos_idx[:, :, 1:-1, 1:-1]
-        neg_peak = F.max_pool2d(magnitude * pos_angle[:, :, 1], (3, 3), stride=1, padding=1)[:, :, 1:-1, 1:-1]
-        neg_mask = (magnitude[:, :, 1:-1, 1:-1] > neg_peak) & ~pos_idx[:, :, 1:-1, 1:-1]
-
-        edges = torch.zeros_like(magnitude)
-        edges[:, :, 1:-1, 1:-1] = (pos_mask | neg_mask).float() * magnitude[:, :, 1:-1, 1:-1]
-
-        high_mask = (edges > high_threshold)
-        low_mask = (edges > low_threshold)
-
-        edges = high_mask.float() + low_mask.float()
-
-        return edges
+        return magnitude
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -544,12 +584,13 @@ class Fontify(nn.Module):
         x = self.decoder_pred(x) # Bx3xHxW
         return x
 
-    def forward_loss(self, imgs, pred, tgts, mask, valid):
+    def forward_loss(self, imgs, pred, tgts, mask, valid, epoch=0):
         """
         tgts: [N, 3, H, W]
         pred: [N, 3, H, W]
         mask: [N, L], 0 is keep, 1 is remove, 
         valid: [N, 3, H, W]
+        epoch: 当前训练epoch，用于动态损失权重计算
         """
         mask = mask[:, :, None].repeat(1, 1, self.patch_size**2 * 3)
         mask = self.unpatchify(mask)
@@ -580,17 +621,13 @@ class Fontify(nn.Module):
         ])
 
         with torch.cuda.amp.autocast(enabled=False):
-            Ploss = VGGPerceptualLoss().to(imgs.device)
             pred_img = transform_vgg(pred).float()
             target_img = transform_vgg(target).float()
-            #l_vgg = PerceptualLoss().to(imgs.device)
-            #loss_vgg = l_vgg(pred_img, target_img)
-            loss_vgg = Ploss(pred_img, target_img)
-            #print(f"loss:{loss}")
+            loss_vgg = self.vgg_loss(pred_img, target_img)
             # Edge Loss
 
-        edge_pred = self.canny_edge_detection(pred)
-        edge_target = self.canny_edge_detection(target)
+        edge_pred = self.improved_edge_detection(pred)
+        edge_target = self.improved_edge_detection(target)
         loss_edge = F.l1_loss(edge_pred, edge_target)
 
         pred_resized = self.resize(pred)
@@ -600,10 +637,14 @@ class Fontify(nn.Module):
             fake_output.squeeze(1),
             real_labels
         )
-        loss = loss_l1l2 + loss_vgg  + 0.1 * adv_loss +0.8*loss_edge
+        
+        # 获取动态损失权重（前10个epoch对抗损失和边缘损失权重为0）
+        adv_weight, edge_weight = self.get_dynamic_loss_weights(epoch)
+        
+        loss = loss_l1l2 + loss_vgg + adv_weight * adv_loss + edge_weight * loss_edge
         return loss, loss_l1l2, loss_vgg
 
-    def forward(self, imgs, tgts, bool_masked_pos=None, valid=None):
+    def forward(self, imgs, tgts, bool_masked_pos=None, valid=None, epoch=0):
         #imgs = self.tps(imgs)
         #tgts = self.tps(tgts)
         if bool_masked_pos is None:
@@ -612,7 +653,7 @@ class Fontify(nn.Module):
             bool_masked_pos = bool_masked_pos.flatten(1).to(torch.bool)
         latent = self.forward_encoder(imgs, tgts, bool_masked_pos)
         pred = self.forward_decoder(latent)  # [N, L, p*p*3]
-        loss, loss_l1l2, loss_vgg = self.forward_loss(imgs, pred, tgts, bool_masked_pos, valid)
+        loss, loss_l1l2, loss_vgg = self.forward_loss(imgs, pred, tgts, bool_masked_pos, valid, epoch=epoch)
         return loss, loss_l1l2, loss_vgg, self.patchify(pred), bool_masked_pos, pred
 
 
